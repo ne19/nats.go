@@ -47,7 +47,7 @@ import (
 
 // Default Constants
 const (
-	Version                   = "1.39.0"
+	Version                   = "1.43.0"
 	DefaultURL                = "nats://127.0.0.1:4222"
 	DefaultPort               = 4222
 	DefaultMaxReconnect       = 60
@@ -274,7 +274,6 @@ type InProcessConnProvider interface {
 
 // Options can be used to create a customized connection.
 type Options struct {
-
 	// Url represents a single NATS server url to which the client
 	// will be connecting. If the Servers option is also set, it
 	// then becomes the first server in the Servers array.
@@ -421,6 +420,10 @@ type Options struct {
 
 	// AsyncErrorCB sets the async error handler (e.g. slow consumer errors)
 	AsyncErrorCB ErrHandler
+
+	// ReconnectErrCB sets the callback that is invoked whenever a
+	// reconnect attempt failed
+	ReconnectErrCB ConnErrHandler
 
 	// ReconnectBufSize is the size of the backing bufio during reconnect.
 	// Once this has been exhausted publish operations will return an error.
@@ -574,7 +577,7 @@ type Conn struct {
 	pongs         []chan struct{}
 	scratch       [scratchSize]byte
 	status        Status
-	statListeners map[Status][]chan Status
+	statListeners map[Status]map[chan Status]struct{}
 	initc         bool // true if the connection is performing the initial connect
 	err           error
 	ps            *parseState
@@ -1152,6 +1155,14 @@ func ConnectHandler(cb ConnHandler) Option {
 func ReconnectHandler(cb ConnHandler) Option {
 	return func(o *Options) error {
 		o.ReconnectedCB = cb
+		return nil
+	}
+}
+
+// ReconnectErrHandler is an Option to set the reconnect error handler.
+func ReconnectErrHandler(cb ConnErrHandler) Option {
+	return func(o *Options) error {
+		o.ReconnectErrCB = cb
 		return nil
 	}
 }
@@ -2226,6 +2237,7 @@ func (nc *Conn) ForceReconnect() error {
 		// even if we're in the middle of a backoff
 		if nc.rqch != nil {
 			close(nc.rqch)
+			nc.rqch = nil
 		}
 		return nil
 	}
@@ -2291,6 +2303,21 @@ func (nc *Conn) ConnectedAddr() string {
 		return _EMPTY_
 	}
 	return nc.conn.RemoteAddr().String()
+}
+
+// LocalAddr returns the local network address of the connection
+func (nc *Conn) LocalAddr() string {
+	if nc == nil {
+		return _EMPTY_
+	}
+
+	nc.mu.RLock()
+	defer nc.mu.RUnlock()
+
+	if nc.status != CONNECTED {
+		return _EMPTY_
+	}
+	return nc.conn.LocalAddr().String()
 }
 
 // ConnectedServerId reports the connected server's Id
@@ -2399,7 +2426,6 @@ func (nc *Conn) setup() {
 
 // Process a connected connection and initialize properly.
 func (nc *Conn) processConnectInit() error {
-
 	// Set our deadline for the whole connect process
 	nc.conn.SetDeadline(time.Now().Add(nc.Opts.Timeout))
 	defer nc.conn.SetDeadline(time.Time{})
@@ -2548,7 +2574,6 @@ func (nc *Conn) checkForSecure() error {
 // processExpectedInfo will look for the expected first INFO message
 // sent when a connection is established. The lock should be held entering.
 func (nc *Conn) processExpectedInfo() error {
-
 	c := &control{}
 
 	// Read the protocol
@@ -2653,8 +2678,10 @@ func (nc *Conn) connectProto() (string, error) {
 
 	// If our server does not support headers then we can't do them or no responders.
 	hdrs := nc.info.Headers
-	cinfo := connectInfo{o.Verbose, o.Pedantic, ujwt, nkey, sig, user, pass, token,
-		o.Secure, o.Name, LangString, Version, clientProtoInfo, !o.NoEcho, hdrs, hdrs}
+	cinfo := connectInfo{
+		o.Verbose, o.Pedantic, ujwt, nkey, sig, user, pass, token,
+		o.Secure, o.Name, LangString, Version, clientProtoInfo, !o.NoEcho, hdrs, hdrs,
+	}
 
 	b, err := json.Marshal(cinfo)
 	if err != nil {
@@ -2845,6 +2872,16 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 	var rt *time.Timer
 	// Channel used to kick routine out of sleep when conn is closed.
 	rqch := nc.rqch
+
+	// if rqch is nil, we need to set it up to signal
+	// the reconnect loop to reconnect immediately
+	// this means that `ForceReconnect` was called
+	// before entering doReconnect
+	if rqch == nil {
+		rqch = make(chan struct{})
+		close(rqch)
+	}
+
 	// Counter that is increased when the whole list of servers has been tried.
 	var wlf int
 
@@ -2924,10 +2961,13 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 
 		// Try to create a new connection
 		err = nc.createConn()
-
 		// Not yet connected, retry...
 		// Continue to hold the lock
 		if err != nil {
+			// Perform appropriate callback for a failed connection attempt.
+			if nc.Opts.ReconnectErrCB != nil {
+				nc.ach.push(func() { nc.Opts.ReconnectErrCB(nc, err) })
+			}
 			nc.err = nil
 			continue
 		}
@@ -3272,7 +3312,7 @@ func (nc *Conn) processMsg(data []byte) {
 	// It's possible that we end-up not using the message, but that's ok.
 
 	// FIXME(dlc): Need to copy, should/can do COW?
-	var msgPayload = data
+	msgPayload := data
 	if !nc.ps.msgCopied {
 		msgPayload = make([]byte, len(data))
 		copy(msgPayload, data)
@@ -3463,8 +3503,10 @@ slowConsumer:
 	}
 }
 
-var permissionsRe = regexp.MustCompile(`Subscription to "(\S+)"`)
-var permissionsQueueRe = regexp.MustCompile(`using queue "(\S+)"`)
+var (
+	permissionsRe      = regexp.MustCompile(`Subscription to "(\S+)"`)
+	permissionsQueueRe = regexp.MustCompile(`using queue "(\S+)"`)
+)
 
 // processTransientError is called when the server signals a non terminal error
 // which does not close the connection or trigger a reconnect.
@@ -3989,7 +4031,7 @@ func (nc *Conn) publish(subj, reply string, hdr, data []byte) error {
 	// go 1.14 some values strconv faster, may be able to switch over.
 
 	var b [12]byte
-	var i = len(b)
+	i := len(b)
 
 	if hdr != nil {
 		if len(hdr) > 0 {
@@ -4597,6 +4639,8 @@ func (s *Subscription) StatusChanged(statuses ...SubStatus) <-chan SubStatus {
 		statuses = []SubStatus{SubscriptionActive, SubscriptionDraining, SubscriptionClosed, SubscriptionSlowConsumer}
 	}
 	ch := make(chan SubStatus, 10)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, status := range statuses {
 		s.registerStatusChangeListener(status, ch)
 		// initial status
@@ -4610,9 +4654,8 @@ func (s *Subscription) StatusChanged(statuses ...SubStatus) <-chan SubStatus {
 // registerStatusChangeListener registers a channel waiting for a specific status change event.
 // Status change events are non-blocking - if no receiver is waiting for the status change,
 // it will not be sent on the channel. Closed channels are ignored.
+// Lock should be held entering.
 func (s *Subscription) registerStatusChangeListener(status SubStatus, ch chan SubStatus) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.statListeners == nil {
 		s.statListeners = make(map[chan SubStatus][]SubStatus)
 	}
@@ -5690,7 +5733,7 @@ func (nc *Conn) IsDraining() bool {
 // caller must lock
 func (nc *Conn) getServers(implicitOnly bool) []string {
 	poolSize := len(nc.srvPool)
-	var servers = make([]string, 0)
+	servers := make([]string, 0)
 	for i := 0; i < poolSize; i++ {
 		if implicitOnly && !nc.srvPool[i].isImplicit {
 			continue
@@ -5890,25 +5933,47 @@ func (nc *Conn) StatusChanged(statuses ...Status) chan Status {
 		statuses = []Status{CONNECTED, RECONNECTING, DISCONNECTED, CLOSED}
 	}
 	ch := make(chan Status, 10)
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
 	for _, s := range statuses {
 		nc.registerStatusChangeListener(s, ch)
 	}
 	return ch
 }
 
+// RemoveStatusListener removes a status change listener.
+// If the channel is not closed, it will be closed.
+// Listeners will be removed automatically on status change
+// as well, but this is a way to remove them manually.
+func (nc *Conn) RemoveStatusListener(ch chan (Status)) {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+
+	select {
+	case <-ch:
+	default:
+		close(ch)
+	}
+
+	for _, listeners := range nc.statListeners {
+		for l := range listeners {
+			delete(listeners, l)
+		}
+	}
+}
+
 // registerStatusChangeListener registers a channel waiting for a specific status change event.
 // Status change events are non-blocking - if no receiver is waiting for the status change,
 // it will not be sent on the channel. Closed channels are ignored.
+// The lock should be held entering.
 func (nc *Conn) registerStatusChangeListener(status Status, ch chan Status) {
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
 	if nc.statListeners == nil {
-		nc.statListeners = make(map[Status][]chan Status)
+		nc.statListeners = make(map[Status]map[chan Status]struct{})
 	}
 	if _, ok := nc.statListeners[status]; !ok {
-		nc.statListeners[status] = make([]chan Status, 0)
+		nc.statListeners[status] = make(map[chan Status]struct{})
 	}
-	nc.statListeners[status] = append(nc.statListeners[status], ch)
+	nc.statListeners[status][ch] = struct{}{}
 }
 
 // sendStatusEvent sends connection status event to all channels.
@@ -5916,20 +5981,18 @@ func (nc *Conn) registerStatusChangeListener(status Status, ch chan Status) {
 // will not block. Lock should be held entering.
 func (nc *Conn) sendStatusEvent(s Status) {
 Loop:
-	for i := 0; i < len(nc.statListeners[s]); i++ {
+	for ch := range nc.statListeners[s] {
 		// make sure channel is not closed
 		select {
-		case <-nc.statListeners[s][i]:
+		case <-ch:
 			// if chan is closed, remove it
-			nc.statListeners[s][i] = nc.statListeners[s][len(nc.statListeners[s])-1]
-			nc.statListeners[s] = nc.statListeners[s][:len(nc.statListeners[s])-1]
-			i--
+			delete(nc.statListeners[s], ch)
 			continue Loop
 		default:
 		}
 		// only send event if someone's listening
 		select {
-		case nc.statListeners[s][i] <- s:
+		case ch <- s:
 		default:
 		}
 	}

@@ -614,6 +614,37 @@ func TestKeyValueWatch(t *testing.T) {
 		expectOk(t, kv.Delete(ctx, "age"))
 		expectDelete("age", 6)
 	})
+
+	t.Run("stop watcher should not block", func(t *testing.T) {
+		s := RunBasicJetStreamServer()
+		defer shutdownJSServerAndRemoveStorage(t, s)
+
+		nc, js := jsClient(t, s)
+		defer nc.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "WATCH"})
+		expectOk(t, err)
+
+		watcher, err := kv.WatchAll(ctx)
+		expectOk(t, err)
+
+		expectInitDone := expectInitDoneF(t, watcher)
+		expectInitDone()
+
+		err = watcher.Stop()
+		expectOk(t, err)
+
+		select {
+		case _, ok := <-watcher.Updates():
+			if ok {
+				t.Fatalf("Expected channel to be closed")
+			}
+		case <-time.After(100 * time.Millisecond):
+			break
+		}
+	})
 }
 
 func TestKeyValueWatchContext(t *testing.T) {
@@ -1087,6 +1118,23 @@ func TestListKeysFiltered(t *testing.T) {
 		if !contains(filteredKeys, key) {
 			t.Fatalf("Expected key %s in filtered keys, but not found", key)
 		}
+	}
+
+	// delete apple so we can ensure we do not see it later after another filtered search
+	err = kv.Delete(ctx, "apple")
+	expectOk(t, err)
+
+	filters = []string{"apple"}
+	keyLister, err = kv.ListKeysFiltered(ctx, filters...)
+	expectOk(t, err)
+
+	// reset filtered keys
+	filteredKeys = nil
+	for key := range keyLister.Keys() {
+		filteredKeys = append(filteredKeys, key)
+	}
+	if len(filteredKeys) != 0 {
+		t.Fatalf("Expected 0 deleted keys, but %d was found", len(filteredKeys))
 	}
 }
 
@@ -1853,4 +1901,134 @@ func TestKeyValueCreateRepairOldKV(t *testing.T) {
 	if !errors.Is(err, jetstream.ErrBucketExists) {
 		t.Fatalf("Expected error to be ErrBucketExists, got: %v", err)
 	}
+}
+
+func TestKeyValueLimitMarkerTTL(t *testing.T) {
+	checkMsgHeaders := func(t *testing.T, js jetstream.JetStream, kv jetstream.KeyValue, key, expectedTTL, expectedReason string) {
+		t.Helper()
+		ctx := context.Background()
+		stream, err := js.Stream(ctx, "KV_KVS")
+		expectOk(t, err)
+		msg, err := stream.GetLastMsgForSubject(ctx, "$KV.KVS."+key)
+		expectOk(t, err)
+		marker := msg.Header.Get(jetstream.MarkerReasonHeader)
+		if marker != expectedReason {
+			t.Fatalf("Expected marker to be MaxAge, got %q", marker)
+		}
+		ttl := msg.Header.Get(jetstream.MsgTTLHeader)
+		if ttl != expectedTTL {
+			t.Fatalf("Expected TTL to be 1s, got %q", ttl)
+		}
+	}
+
+	checkMsgNotFound := func(t *testing.T, js jetstream.JetStream, kv jetstream.KeyValue, key string) {
+		t.Helper()
+		ctx := context.Background()
+		stream, err := js.Stream(ctx, "KV_KVS")
+		expectOk(t, err)
+		msg, err := stream.GetLastMsgForSubject(ctx, "$KV.KVS."+key)
+		if err == nil {
+			t.Fatalf("Expected error getting message, got %v", msg)
+		}
+		if !errors.Is(err, jetstream.ErrMsgNotFound) {
+			t.Fatalf("Expected error to be ErrMsgNotFound, got: %v", err)
+		}
+	}
+
+	t.Run("create with TTL", func(t *testing.T) {
+		s := RunBasicJetStreamServer()
+		defer shutdownJSServerAndRemoveStorage(t, s)
+
+		nc, js := jsClient(t, s)
+		defer nc.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "KVS", LimitMarkerTTL: time.Second})
+		expectOk(t, err)
+
+		// Put in a few names and ages.
+		_, err = kv.Create(ctx, "age", []byte("22"), jetstream.KeyTTL(time.Second))
+		expectOk(t, err)
+
+		// create watcher to wait for deletion
+		watcher, err := kv.WatchAll(ctx, jetstream.UpdatesOnly())
+		expectOk(t, err)
+
+		_, err = kv.Get(ctx, "age")
+		expectOk(t, err)
+		time.Sleep(1500 * time.Millisecond)
+
+		_, err = kv.Get(ctx, "age")
+		expectErr(t, err, jetstream.ErrKeyNotFound)
+		// check if marker exists on stream
+		checkMsgHeaders(t, js, kv, "age", "1s", "MaxAge")
+
+		time.Sleep(time.Second)
+		_, err = kv.Get(ctx, "age")
+		expectErr(t, err, jetstream.ErrKeyNotFound)
+		// now msg should be gone from stream
+		checkMsgNotFound(t, js, kv, "age")
+
+		entry := <-watcher.Updates()
+		if entry == nil {
+			t.Fatalf("Expected entry, got nil")
+		}
+		if entry.Operation() != jetstream.KeyValuePurge {
+			t.Fatalf("Expected purge operation, got %v", entry.Operation())
+		}
+		if entry.Key() != "age" {
+			t.Fatalf("Expected key %q, got %q", "age", entry.Key())
+		}
+	})
+
+	t.Run("purge with TTL", func(t *testing.T) {
+		s := RunBasicJetStreamServer()
+		defer shutdownJSServerAndRemoveStorage(t, s)
+
+		nc, js := jsClient(t, s)
+		defer nc.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		kv, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "KVS", LimitMarkerTTL: time.Second})
+		expectOk(t, err)
+
+		// Put in a few names and ages.
+		_, err = kv.Create(ctx, "age", []byte("22"))
+		expectOk(t, err)
+
+		watcher, err := kv.WatchAll(ctx, jetstream.UpdatesOnly())
+		expectOk(t, err)
+
+		err = kv.Purge(ctx, "age", jetstream.PurgeTTL(time.Second))
+		expectOk(t, err)
+
+		_, err = kv.Get(ctx, "age")
+		expectErr(t, err, jetstream.ErrKeyNotFound)
+		// check if msg with ttl exists on stream
+		checkMsgHeaders(t, js, kv, "age", "1s", "")
+		expectErr(t, err, jetstream.ErrKeyNotFound)
+
+		time.Sleep(1500 * time.Millisecond)
+		_, err = kv.Get(ctx, "age")
+		expectErr(t, err, jetstream.ErrKeyNotFound)
+
+		// check if marker exists on stream
+		checkMsgHeaders(t, js, kv, "age", "1s", "MaxAge")
+		time.Sleep(time.Second)
+		// now msg should be gone from stream
+		checkMsgNotFound(t, js, kv, "age")
+
+		entry := <-watcher.Updates()
+		if entry == nil {
+			t.Fatalf("Expected entry, got nil")
+		}
+		if entry.Operation() != jetstream.KeyValuePurge {
+			t.Fatalf("Expected purge operation, got %v", entry.Operation())
+		}
+		if entry.Key() != "age" {
+			t.Fatalf("Expected key %q, got %q", "age", entry.Key())
+		}
+	})
 }

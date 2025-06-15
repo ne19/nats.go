@@ -454,6 +454,35 @@ func TestKeyValueWatch(t *testing.T) {
 		expectOk(t, kv.Delete("age"))
 		expectDelete("age", 6)
 	})
+
+	t.Run("stop watcher should not block", func(t *testing.T) {
+		s := RunBasicJetStreamServer()
+		defer shutdownJSServerAndRemoveStorage(t, s)
+
+		nc, js := jsClient(t, s)
+		defer nc.Close()
+
+		kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "WATCH"})
+		expectOk(t, err)
+
+		watcher, err := kv.WatchAll()
+		expectOk(t, err)
+
+		expectInitDone := expectInitDoneF(t, watcher)
+		expectInitDone()
+
+		err = watcher.Stop()
+		expectOk(t, err)
+
+		select {
+		case _, ok := <-watcher.Updates():
+			if ok {
+				t.Fatalf("Expected channel to be closed")
+			}
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("Stop watcher did not return")
+		}
+	})
 }
 
 func TestKeyValueWatchContext(t *testing.T) {
@@ -1361,7 +1390,7 @@ func TestKeyValueNonDirectGet(t *testing.T) {
 		t.Fatalf("Error on get: v=%+v err=%v", v, err)
 	}
 	if v, err := kvi.GetRevision("key1", 1); err != nil || string(v.Value()) != "val1" {
-		t.Fatalf("Error on get revisiong: v=%+v err=%v", v, err)
+		t.Fatalf("Error on get revision: v=%+v err=%v", v, err)
 	}
 	if v, err := kvi.GetRevision("key1", 2); err == nil {
 		t.Fatalf("Expected error, got %+v", v)
@@ -1639,4 +1668,90 @@ func TestKeyValueCompression(t *testing.T) {
 	if kvStream.Config.Compression != nats.S2Compression {
 		t.Fatalf("Expected stream to be compressed with S2")
 	}
+}
+
+func TestListKeysFromPurgedStream(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdownJSServerAndRemoveStorage(t, s)
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream(nats.MaxWait(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Error getting jetstream context: %v", err)
+	}
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "A"})
+	if err != nil {
+		t.Fatalf("Error creating kv: %v", err)
+	}
+
+	for i := range 10000 {
+		if _, err := kv.Put(fmt.Sprintf("key-%d", i), []byte("val")); err != nil {
+			t.Fatalf("Error putting key: %v", err)
+		}
+	}
+
+	// purge the stream after a bit
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		if err := js.PurgeStream("KV_A"); err != nil {
+			t.Logf("Error purging stream: %v", err)
+		}
+	}()
+	keys, err := kv.ListKeys()
+	if err != nil {
+		t.Fatalf("Error listing keys: %v", err)
+	}
+
+	// there should not be a deadlock here
+	for {
+		select {
+		case _, ok := <-keys.Keys():
+			if !ok {
+				return
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Timeout waiting for keys")
+		}
+	}
+}
+
+func TestKeyValueWatcherStopTimer(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer shutdownJSServerAndRemoveStorage(t, s)
+
+	nc, err := nats.Connect(s.ClientURL())
+	if err != nil {
+		t.Fatalf("Error on connect: %v", err)
+	}
+	defer nc.Close()
+
+	js, err := nc.JetStream(nats.MaxWait(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("Error getting jetstream context: %v", err)
+	}
+
+	kv, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "TEST"})
+	if err != nil {
+		t.Fatalf("Error creating kv: %v", err)
+	}
+	for i := range 1000 {
+		if _, err := kv.Put(fmt.Sprintf("key-%d", i), []byte("val")); err != nil {
+			t.Fatalf("Error putting key: %v", err)
+		}
+	}
+
+	w, err := kv.WatchAll()
+	if err != nil {
+		t.Fatalf("Error creating watcher: %v", err)
+	}
+	if err := w.Stop(); err != nil {
+		t.Fatalf("Error stopping watcher: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
 }
