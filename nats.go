@@ -478,6 +478,11 @@ type Options struct {
 	// when Close is invoked by user code. Default is to invoke the callbacks.
 	NoCallbacksAfterClientClose bool
 
+	// CallbacksOnInitialConnect allows the invocation of callbacks when
+	// the client connects to the server for the first time. By default,
+	// callbacks are invoked only after the initial connect is successful.
+	CallbacksOnInitialConnect bool
+
 	// LameDuckModeHandler sets the callback to invoke when the server notifies
 	// the connection that it entered lame duck mode, that is, going to
 	// gradually disconnect all its connections before shutting down. This is
@@ -1423,6 +1428,14 @@ func TLSHandshakeFirst() Option {
 	return func(o *Options) error {
 		o.TLSHandshakeFirst = true
 		o.Secure = true
+		return nil
+	}
+}
+
+// CallbacksOnInitialConnect is an Option to enable all callbacks on the initial connect.
+func CallbacksOnInitialConnect() Option {
+	return func(o *Options) error {
+		o.CallbacksOnInitialConnect = true
 		return nil
 	}
 }
@@ -2683,7 +2696,7 @@ func (nc *Conn) sendConnect() error {
 	// Construct the CONNECT protocol string
 	cProto, err := nc.connectProto()
 	if err != nil {
-		if !nc.initc && nc.Opts.AsyncErrorCB != nil {
+		if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && nc.Opts.AsyncErrorCB != nil {
 			nc.ach.push(func() { nc.Opts.AsyncErrorCB(nc, nil, err) })
 		}
 		return err
@@ -2700,7 +2713,7 @@ func (nc *Conn) sendConnect() error {
 	// reading byte-by-byte here is ok.
 	proto, err := nc.readProto()
 	if err != nil {
-		if !nc.initc && nc.Opts.AsyncErrorCB != nil {
+		if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && nc.Opts.AsyncErrorCB != nil {
 			nc.ach.push(func() { nc.Opts.AsyncErrorCB(nc, nil, err) })
 		}
 		return err
@@ -2711,7 +2724,7 @@ func (nc *Conn) sendConnect() error {
 		// Read the rest now...
 		proto, err = nc.readProto()
 		if err != nil {
-			if !nc.initc && nc.Opts.AsyncErrorCB != nil {
+			if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && nc.Opts.AsyncErrorCB != nil {
 				nc.ach.push(func() { nc.Opts.AsyncErrorCB(nc, nil, err) })
 			}
 			return err
@@ -2818,7 +2831,7 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 	nc.err = nil
 	// Perform appropriate callback if needed for a disconnect.
 	// DisconnectedErrCB has priority over deprecated DisconnectedCB
-	if !nc.initc {
+	if !nc.initc || nc.Opts.CallbacksOnInitialConnect {
 		if nc.Opts.DisconnectedErrCB != nil {
 			nc.ach.push(func() { nc.Opts.DisconnectedErrCB(nc, err) })
 		} else if nc.Opts.DisconnectedCB != nil {
@@ -2963,9 +2976,9 @@ func (nc *Conn) doReconnect(err error, forceReconnect bool) {
 		// Queue up the correct callback. If we are in initial connect state
 		// (using retry on failed connect), we will call the ConnectedCB,
 		// otherwise the ReconnectedCB.
-		if nc.Opts.ReconnectedCB != nil && !nc.initc {
+		if nc.Opts.ReconnectedCB != nil && (!nc.initc || nc.Opts.CallbacksOnInitialConnect) {
 			nc.ach.push(func() { nc.Opts.ReconnectedCB(nc) })
-		} else if nc.Opts.ConnectedCB != nil && nc.initc {
+		} else if nc.Opts.ConnectedCB != nil && (!nc.initc || nc.Opts.CallbacksOnInitialConnect) {
 			nc.ach.push(func() { nc.Opts.ConnectedCB(nc) })
 		}
 
@@ -3496,7 +3509,7 @@ func (nc *Conn) processTransientError(err error) {
 // Connection lock is held on entry
 func (nc *Conn) processAuthError(err error) bool {
 	nc.err = err
-	if !nc.initc && nc.Opts.AsyncErrorCB != nil {
+	if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && nc.Opts.AsyncErrorCB != nil {
 		nc.ach.push(func() { nc.Opts.AsyncErrorCB(nc, nil, err) })
 	}
 	// We should give up if we tried twice on this server and got the
@@ -3598,7 +3611,7 @@ func (nc *Conn) processInfo(info string) error {
 	// did not include themselves in the async INFO protocol.
 	// If empty, do not remove the implicit servers from the pool.
 	if len(nc.info.ConnectURLs) == 0 {
-		if !nc.initc && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
+		if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
 			nc.ach.push(func() { nc.Opts.LameDuckModeHandler(nc) })
 		}
 		return nil
@@ -3657,11 +3670,11 @@ func (nc *Conn) processInfo(info string) error {
 		if !nc.Opts.NoRandomize {
 			nc.shufflePool(1)
 		}
-		if !nc.initc && nc.Opts.DiscoveredServersCB != nil {
+		if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && nc.Opts.DiscoveredServersCB != nil {
 			nc.ach.push(func() { nc.Opts.DiscoveredServersCB(nc) })
 		}
 	}
-	if !nc.initc && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
+	if (!nc.initc || nc.Opts.CallbacksOnInitialConnect) && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
 		nc.ach.push(func() { nc.Opts.LameDuckModeHandler(nc) })
 	}
 	return nil
